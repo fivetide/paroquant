@@ -10,11 +10,26 @@ import transformers.activations as _act
 if not hasattr(_act, "PytorchGELUTanh"):
     _act.PytorchGELUTanh = _act.GELUActivation
 
-from awq.modules.linear.gemm import WQLinearMMFunction
+try:
+    if torch.version.hip is not None:
+        raise ImportError("prefer ROCm AWQ fallback on HIP builds")
+    from awq.modules.linear.gemm import WQLinearMMFunction
+except ImportError:
+    WQLinearMMFunction = None
+
+if torch.version.hip is not None:
+    from paroquant.kernels.rocm.awq import awq_linear as rocm_awq_linear
+else:
+    rocm_awq_linear = None
 
 
 class RotateQuantizedLinear(nn.Module):
-    """Pairwise Givens rotation + INT4 quantized matmul (AWQ GEMM kernel).
+    """Pairwise Givens rotation + INT4 quantized matmul.
+
+    On NVIDIA/CUDA this uses AutoAWQ's GEMM kernel when available. On ROCm/HIP it
+    uses a local AWQ uint4 dequantization kernel followed by torch.matmul. The
+    ROCm path is a correctness/runtime bridge for PARO checkpoints; it is not yet
+    a fused packed-W4 GEMV/GEMM performance path.
 
     All parameters are stored flat (no submodules), so state dict keys like
     ``gate_proj.theta`` and ``gate_proj.qweight`` match checkpoint naming directly.
@@ -58,7 +73,21 @@ class RotateQuantizedLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype == torch.float16, f"Expected float16 input, got {x.dtype}"
         x = torch.ops.rotation.rotate(x, self.pairs, self.theta, self.channel_scales)
-        y = WQLinearMMFunction.apply(
+        if WQLinearMMFunction is not None:
+            y = WQLinearMMFunction.apply(
+                x,
+                self.qweight,
+                self.qzeros,
+                self.scales,
+                self.w_bit,
+                self.group_size,
+                self.bias,
+                self.out_features,
+            )
+            return y.reshape(*x.shape[:-1], self.out_features)
+        if rocm_awq_linear is None:
+            raise RuntimeError("AutoAWQ is not installed and no ROCm AWQ fallback is available")
+        return rocm_awq_linear(
             x,
             self.qweight,
             self.qzeros,
@@ -66,6 +95,4 @@ class RotateQuantizedLinear(nn.Module):
             self.w_bit,
             self.group_size,
             self.bias,
-            self.out_features,
         )
-        return y.reshape(*x.shape[:-1], self.out_features)
