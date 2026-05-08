@@ -8,7 +8,10 @@ from typing import Literal
 import simple_parsing
 import torch
 import torch.nn as nn
-import wandb
+try:
+    import wandb
+except ImportError:  # Optional unless --use-wandb is set.
+    wandb = None
 from tqdm import tqdm
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeExperts
 
@@ -92,6 +95,8 @@ class Config:
 def setup_wandb(args: Config) -> wandb.Run | None:
     if not args.use_wandb:
         return None
+    if wandb is None:
+        raise RuntimeError("wandb is required when --use-wandb is set")
     wandb_run = wandb.init(config=vars(args))
     logger.info(
         f"wandb logging enabled: entity={wandb_run.entity}, project={wandb_run.project}, run_name={wandb_run.name}"
