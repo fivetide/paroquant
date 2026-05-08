@@ -27,9 +27,10 @@ class RotateQuantizedLinear(nn.Module):
     """Pairwise Givens rotation + INT4 quantized matmul.
 
     On NVIDIA/CUDA this uses AutoAWQ's GEMM kernel when available. On ROCm/HIP it
-    uses a local AWQ uint4 dequantization kernel followed by torch.matmul. The
-    ROCm path is a correctness/runtime bridge for PARO checkpoints; it is not yet
-    a fused packed-W4 GEMV/GEMM performance path.
+    uses a local AWQ uint4 path: direct packed GEMV for selected c=1 shapes, and
+    dequantization followed by torch.matmul otherwise. The ROCm path is still a
+    correctness/runtime bridge for PARO checkpoints, not the final tuned W4
+    kernel family.
 
     All parameters are stored flat (no submodules), so state dict keys like
     ``gate_proj.theta`` and ``gate_proj.qweight`` match checkpoint naming directly.
