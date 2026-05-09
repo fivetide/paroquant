@@ -30,7 +30,7 @@ class PseudoQuantizedLinear(nn.Module):
         self.out_feat = self.weight.shape[0]
         num_groups = self.in_feat // group_size
         assert self.in_feat % group_size == 0
-        assert self.weight.dtype == torch.float16 or self.weight.dtype == torch.float32
+        assert self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         if rotation_pairs is not None:
             pairs_grouped, angles_grouped, mask = rotation_pairs
             assert pairs_grouped.size(0) == num_rotations

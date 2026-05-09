@@ -86,6 +86,9 @@ class Config:
     resume: bool = False
     # Whether to enable gradient checkpointing.
     checkpointing: bool = False
+    # Optional smoke/debug limit: optimize only the first N transformer layers.
+    # Full artifacts should leave this unset.
+    max_layers: int | None = None
 
     seed: int
 
@@ -241,8 +244,16 @@ def main():
                 pseudo_module.enable_checkpoint = enable
 
     # Layerwise, multi-stage optimization.
-    for layer_idx, layer in enumerate(tqdm(blocks)):
+    blocks_to_optimize = blocks
+    if args.max_layers is not None:
+        if args.max_layers <= 0:
+            raise ValueError("--max-layers must be positive when set")
+        blocks_to_optimize = blocks[: args.max_layers]
+        logger.warning("Debug/smoke mode: optimizing only the first %d layer(s).", len(blocks_to_optimize))
+
+    for layer_idx, layer in enumerate(tqdm(blocks_to_optimize)):
         empty_cache()
+        layer_eval_dtype = next(layer.parameters()).dtype
         logger.info(f"Capturing original layer output...")
         # Original output of this layer.
         og_layer_output_batches = forward_layer_batch(
@@ -320,7 +331,7 @@ def main():
                     group_size=args.group_size,
                     num_rotations=args.num_rotations,
                 )
-                channel_scales = torch.ones(1, weight.shape[1], dtype=torch.float16, device=device)
+                channel_scales = torch.ones(1, weight.shape[1], dtype=old_module.weight.dtype, device=device)
 
                 new_module = PseudoQuantizedLinear(
                     old_module,
@@ -455,7 +466,7 @@ def main():
         else:
             logger.info(f"Skipping optimization for layer {layer_idx}: already been optimized.")
 
-        layer.half().to(device)
+        layer.to(device=device, dtype=layer_eval_dtype)
 
         logger.info("Capturing new layer output...")
         new_layer_output_batches = forward_layer_batch(
