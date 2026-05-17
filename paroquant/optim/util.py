@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import gc
+import glob
+import json
 import logging
 import math
 import random
 import warnings
-from typing import TypeVar
+from pathlib import Path
+from typing import Any, Iterable, TypeVar
 
 import torch
 import torch.nn as nn
@@ -87,6 +90,150 @@ def empty_cache():
     torch.cuda.empty_cache()
 
 
+def _normalize_chat_role(role: Any) -> str:
+    role_str = str(role or "user").strip().lower()
+    if role_str in {"human", "user", "instruction", "input"}:
+        return "user"
+    if role_str in {"gpt", "assistant", "model", "bot", "teacher"}:
+        return "assistant"
+    if role_str == "system":
+        return "system"
+    return "user"
+
+
+def _messages_to_text(messages: Any, tokenizer) -> str:
+    if isinstance(messages, str):
+        with suppress(json.JSONDecodeError):
+            messages = json.loads(messages)
+    if isinstance(messages, dict):
+        messages = [messages]
+    if not isinstance(messages, list):
+        return ""
+
+    normalized = []
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = msg.get("role", msg.get("from", msg.get("speaker", "user")))
+            content = msg.get("content", msg.get("value", msg.get("text", "")))
+        elif isinstance(msg, (list, tuple)) and len(msg) == 2:
+            role, content = msg
+        else:
+            continue
+        if content is None:
+            continue
+        normalized.append({"role": _normalize_chat_role(role), "content": str(content)})
+
+    if not normalized:
+        return ""
+
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if apply_chat_template is not None:
+        try:
+            return apply_chat_template(normalized, tokenize=False, add_generation_prompt=False)
+        except Exception:
+            pass
+
+    eos = getattr(tokenizer, "eos_token", "") or ""
+    return "\n\n".join(f"[{m['role'].upper()}]\n{m['content']}" for m in normalized).strip() + eos
+
+
+def _jsonl_row_to_text(row: dict[str, Any], tokenizer) -> str:
+    for key in ("text", "content"):
+        value = row.get(key)
+        if isinstance(value, str):
+            return value
+
+    for key in ("conversations", "messages", "conversation", "chat", "dialogue"):
+        if key in row:
+            text = _messages_to_text(row[key], tokenizer)
+            if text:
+                return text
+
+    # Preference data: calibrate on the preferred trajectory only.
+    if "chosen" in row:
+        text = _messages_to_text(row["chosen"], tokenizer)
+        if text:
+            return text
+
+    # GAD-style rows: prompt is a chat/message list and teacher is the answer.
+    if "prompt" in row and "teacher" in row:
+        messages = row["prompt"]
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        elif isinstance(messages, dict):
+            messages = [messages]
+        elif not isinstance(messages, list):
+            messages = []
+        teacher = row["teacher"]
+        if isinstance(teacher, dict):
+            messages = [*messages, teacher]
+        elif isinstance(teacher, str):
+            messages = [*messages, {"role": "assistant", "content": teacher}]
+        text = _messages_to_text(messages, tokenizer)
+        if text:
+            return text
+
+    # Generic prompt/completion fallback.
+    if isinstance(row.get("prompt"), str) and isinstance(row.get("completion"), str):
+        return f"{row['prompt']}\n{row['completion']}"
+
+    return ""
+
+
+def _resolve_jsonl_paths(data: str) -> list[Path]:
+    source = data.removeprefix("jsonl:")
+    source = str(Path(source).expanduser())
+    if any(ch in source for ch in "*?[]"):
+        paths = [Path(p) for p in glob.glob(source)]
+    else:
+        path = Path(source)
+        if path.is_dir():
+            paths = list(path.glob("*.jsonl"))
+        elif path.is_file() and path.suffix == ".jsonl":
+            paths = [path]
+        else:
+            paths = []
+    paths = sorted(p for p in paths if p.is_file() and p.suffix == ".jsonl")
+    if not paths:
+        raise FileNotFoundError(f"No JSONL calibration files found for {data!r}")
+    return paths
+
+
+def _is_jsonl_calib_source(data: str) -> bool:
+    if data.startswith("jsonl:"):
+        return True
+    try:
+        _resolve_jsonl_paths(data)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _iter_jsonl_texts(data: str, tokenizer, seed: int) -> Iterable[str]:
+    paths = _resolve_jsonl_paths(data)
+    rand = random.Random(seed)
+    rand.shuffle(paths)
+    for path in paths:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, str):
+                    text = row
+                elif isinstance(row, dict):
+                    text = _jsonl_row_to_text(row, tokenizer)
+                else:
+                    text = ""
+                text = text.strip()
+                if text:
+                    yield text
+
+
 def get_mixed_calib_dataset(
     datasets: list[str],
     *,
@@ -128,66 +275,73 @@ def get_calib_dataset(
     seed: int,
     split: str,
 ) -> list[torch.Tensor]:
-    if data == "pileval":
-        if split != "validation":
-            warnings.warn("The split argument is ignored when data is 'pileval'.")
-        dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
-        dataset = dataset.shuffle(seed=seed)
-    elif data == "wikitext2":
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-        dataset = dataset.shuffle(seed=seed)
-    elif data == "c4":
-        if split == "train":
-            dataset = load_dataset(
-                "allenai/c4",
-                data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
-                split=split,
-            )
-        elif split == "validation":
-            dataset = load_dataset(
-                "allenai/c4",
-                data_files={"validation": "en/c4-validation.00001-of-00008.json.gz"},
-                split=split,
-            )
-        dataset = dataset.shuffle(seed=seed)
-    elif data == "redpajama":
-        test_split, val_split = 0.2, 0.1
-        dataset = load_dataset(
-            "liang2kl/RedPajama-Data-1T-Sample-Backup",
-            split="train",
-            trust_remote_code=True,
-        )
-        dataset = dataset.shuffle(seed=seed)
-        test_size = int(len(dataset) * test_split)
-        val_size = int(len(dataset) * val_split)
-        train_size = len(dataset) - test_size - val_size
-        if split == "test":
-            dataset = dataset.select(range(len(dataset) - test_size, len(dataset)))
-        elif split == "validation":
-            dataset = dataset.select(range(len(dataset) - test_size - val_size, len(dataset) - test_size))
-        elif split == "train":
-            dataset = dataset.select(range(0, train_size))
-        else:
-            raise ValueError(f"Invalid split: {split}")
+    allow_long_rows = False
+    if _is_jsonl_calib_source(data):
+        line_iter = _iter_jsonl_texts(data, tokenizer, seed)
+        allow_long_rows = True
     else:
-        raise NotImplementedError
+        if data == "pileval":
+            if split != "validation":
+                warnings.warn("The split argument is ignored when data is 'pileval'.")
+            dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
+            dataset = dataset.shuffle(seed=seed)
+        elif data == "wikitext2":
+            dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+            dataset = dataset.shuffle(seed=seed)
+        elif data == "c4":
+            if split == "train":
+                dataset = load_dataset(
+                    "allenai/c4",
+                    data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
+                    split=split,
+                )
+            elif split == "validation":
+                dataset = load_dataset(
+                    "allenai/c4",
+                    data_files={"validation": "en/c4-validation.00001-of-00008.json.gz"},
+                    split=split,
+                )
+            dataset = dataset.shuffle(seed=seed)
+        elif data == "redpajama":
+            test_split, val_split = 0.2, 0.1
+            dataset = load_dataset(
+                "liang2kl/RedPajama-Data-1T-Sample-Backup",
+                split="train",
+                trust_remote_code=True,
+            )
+            dataset = dataset.shuffle(seed=seed)
+            test_size = int(len(dataset) * test_split)
+            val_size = int(len(dataset) * val_split)
+            train_size = len(dataset) - test_size - val_size
+            if split == "test":
+                dataset = dataset.select(range(len(dataset) - test_size, len(dataset)))
+            elif split == "validation":
+                dataset = dataset.select(range(len(dataset) - test_size - val_size, len(dataset) - test_size))
+            elif split == "train":
+                dataset = dataset.select(range(0, train_size))
+            else:
+                raise ValueError(f"Invalid split: {split}")
+        else:
+            raise NotImplementedError
+        line_iter = (str(row["text"]).strip() for row in dataset if row.get("text") is not None)
 
-    samples = []
-    total_len = 0
-    for row in dataset:
-        line = row["text"]
-        line = line.strip()
+    token_ids: list[int] = []
+    target_len = n_samples * block_size
+    for line in line_iter:
+        if not line:
+            continue
         line_encoded = tokenizer.encode(line)
-        if len(line_encoded) > block_size:
+        if not line_encoded:
             continue
-        sample = torch.tensor([line_encoded])
-        if sample.numel() == 0:
+        if len(line_encoded) > block_size and not allow_long_rows:
             continue
-        samples.append(sample)
-        total_len += len(line_encoded)
-        if total_len >= n_samples * block_size:
+        token_ids.extend(line_encoded)
+        if len(token_ids) >= target_len:
             break
-    samples = torch.cat(samples, dim=1).squeeze(0)
+
+    if not token_ids:
+        raise ValueError(f"Calibration source {data!r} produced no usable text")
+    samples = torch.tensor(token_ids[:target_len])
     n_split = min(samples.shape[0] // block_size, n_samples)
 
     return [samples[i * block_size : (i + 1) * block_size] for i in range(n_split)]

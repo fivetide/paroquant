@@ -410,7 +410,29 @@ class PseudoQuantizedQwen3_5MoeExperts(nn.Module):
             module.group_size = module.group_size.to(device=target_device)
             module.n_bits = module.n_bits.to(device=target_device)
             module.num_rotations = module.num_rotations.to(device=target_device)
-            module.set_optim_enabled(quantizer=True)
+
+            # Restore saved quantizers directly.  Calling
+            # set_optim_enabled(quantizer=True) would recompute quantizers from
+            # full rotated expert weights, creating multi-GB temporaries during
+            # resume and causing OOM on 35B MoE checkpoints.
+            if "gate_up_quantizer.scale" in state_dict:
+                module.gate_up_quantizer = UniformAffineQuantizer.from_state_tensors(
+                    state_dict["gate_up_quantizer.scale"].to(device=target_device, dtype=target_dtype),
+                    state_dict["gate_up_quantizer.zero_point_float"].to(device=target_device, dtype=target_dtype),
+                    state_dict.get("gate_up_quantizer.n_bits", n_bits),
+                    state_dict.get("gate_up_quantizer.group_size", group_size),
+                )
+                module.gate_up_quantizer.set_optim_enabled(True)
+                module.gate_up_quantizer_optim_enabled.fill_(True)
+            if "down_quantizer.scale" in state_dict:
+                module.down_quantizer = UniformAffineQuantizer.from_state_tensors(
+                    state_dict["down_quantizer.scale"].to(device=target_device, dtype=target_dtype),
+                    state_dict["down_quantizer.zero_point_float"].to(device=target_device, dtype=target_dtype),
+                    state_dict.get("down_quantizer.n_bits", n_bits),
+                    state_dict.get("down_quantizer.group_size", group_size),
+                )
+                module.down_quantizer.set_optim_enabled(True)
+                module.down_quantizer_optim_enabled.fill_(True)
 
         module.load_state_dict(state_dict)
         return module

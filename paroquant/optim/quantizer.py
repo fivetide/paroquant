@@ -48,6 +48,39 @@ class UniformAffineQuantizer(nn.Module):
 
         self.enable_checkpoint = False
 
+    @classmethod
+    def from_state_tensors(
+        cls,
+        scale: torch.Tensor,
+        zero_point_float: torch.Tensor,
+        n_bits: int | torch.Tensor,
+        group_size: int | torch.Tensor,
+    ) -> "UniformAffineQuantizer":
+        """Construct from saved quantizer tensors without recalibrating from weights.
+
+        The normal constructor derives scale/zero-point from a full rotated weight
+        tensor. Resume/checkpoint loading already has those tensors, so rebuilding
+        from weights creates large temporaries for MoE expert matrices and can OOM.
+        """
+        module = cls.__new__(cls)
+        nn.Module.__init__(module)
+
+        if not isinstance(n_bits, torch.Tensor):
+            n_bits = torch.tensor(n_bits, device=scale.device)
+        else:
+            n_bits = n_bits.to(device=scale.device)
+        if not isinstance(group_size, torch.Tensor):
+            group_size = torch.tensor(group_size, device=scale.device)
+        else:
+            group_size = group_size.to(device=scale.device)
+
+        module.register_buffer("n_bits", n_bits)
+        module.register_buffer("group_size", group_size)
+        module.scale = nn.Parameter(scale.clone())
+        module.zero_point_float = nn.Parameter(zero_point_float.clone())
+        module.enable_checkpoint = False
+        return module
+
     @property
     def qmin(self) -> int:
         return 0

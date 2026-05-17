@@ -215,9 +215,19 @@ class PseudoQuantizedLinear(nn.Module):
             num_rotations=num_rotations,
         )
 
-        # Initialize the quantizer
+        # Restore saved quantizer parameters directly.  Do not call
+        # set_optim_enabled(quantizer=True) here: that recalibrates from the
+        # rotated full weight and creates unnecessary temporary tensors during
+        # resume.
         if "quantizer.scale" in state_dict:
-            qlinear.set_optim_enabled(quantizer=True)
+            qlinear.quantizer = UniformAffineQuantizer.from_state_tensors(
+                state_dict["quantizer.scale"],
+                state_dict["quantizer.zero_point_float"],
+                state_dict.get("quantizer.n_bits", n_bits),
+                state_dict.get("quantizer.group_size", group_size),
+            )
+            qlinear.quantizer.set_optim_enabled(True)
+            qlinear.quantizer_optim_enabled.fill_(True)
 
         qlinear.load_state_dict(state_dict)
         return qlinear

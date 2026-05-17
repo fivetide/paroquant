@@ -1,3 +1,4 @@
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -27,23 +28,34 @@ else:
         build_dir.mkdir(parents=True, exist_ok=True)
         return build_dir
 
+    def _cuda_host_compiler_flags() -> list[str]:
+        # Arch Linux currently defaults to GCC 16, whose libstdc++ headers use
+        # C++ features NVCC 13.2 does not parse in C++17 mode. Prefer an older
+        # host compiler when available, or allow explicit override.
+        host_cxx = os.environ.get("PAROQUANT_CUDAHOSTCXX") or os.environ.get("CUDAHOSTCXX")
+        if host_cxx is None:
+            host_cxx = shutil.which("g++-15") or shutil.which("g++-14")
+        return [f"-ccbin={host_cxx}"] if host_cxx else []
+
     def _load_rotation_extension():
         build_dir = _rotation_build_directory()
+        extra_cuda_cflags = [
+            "-O3",
+            "-std=c++17",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            "--use_fast_math",
+            *_cuda_host_compiler_flags(),
+        ]
         load_kwargs = dict(
             name="paroquant_rotation",
             sources=[str(_dir / "pybind.cpp"), str(_dir / "rotation.cu")],
             build_directory=str(build_dir),
-            extra_cuda_cflags=[
-                "-O3",
-                "-std=c++17",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",
-                "--use_fast_math",
-            ],
+            extra_cuda_cflags=extra_cuda_cflags,
             extra_cflags=["-O2", "-std=c++17"],
             verbose=False,
         )

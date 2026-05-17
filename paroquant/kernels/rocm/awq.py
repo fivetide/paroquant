@@ -313,7 +313,7 @@ def awq_gemv(
 
 
 def _gemv_max_rows() -> int:
-    return int(os.environ.get("PAROQUANT_ROCM_AWQ_GEMV_MAX_ROWS", "1"))
+    return int(os.environ.get("PAROQUANT_ROCM_AWQ_GEMV_MAX_ROWS", "8"))
 
 
 def _gemv_min_in_features() -> int:
