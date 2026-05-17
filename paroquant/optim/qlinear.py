@@ -25,12 +25,12 @@ class PseudoQuantizedLinear(nn.Module):
     ) -> None:
         super().__init__()
         self.enable_checkpoint = False
-        self.weight = nn.Parameter(linear.weight.clone())
+        self.weight = nn.Parameter(linear.weight.half().clone())
         self.in_feat = self.weight.shape[1]
         self.out_feat = self.weight.shape[0]
         num_groups = self.in_feat // group_size
         assert self.in_feat % group_size == 0
-        assert self.weight.dtype == torch.float16 or self.weight.dtype == torch.float32
+        assert self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         if rotation_pairs is not None:
             pairs_grouped, angles_grouped, mask = rotation_pairs
             assert pairs_grouped.size(0) == num_rotations
@@ -215,9 +215,19 @@ class PseudoQuantizedLinear(nn.Module):
             num_rotations=num_rotations,
         )
 
-        # Initialize the quantizer
+        # Restore saved quantizer parameters directly.  Do not call
+        # set_optim_enabled(quantizer=True) here: that recalibrates from the
+        # rotated full weight and creates unnecessary temporary tensors during
+        # resume.
         if "quantizer.scale" in state_dict:
-            qlinear.set_optim_enabled(quantizer=True)
+            qlinear.quantizer = UniformAffineQuantizer.from_state_tensors(
+                state_dict["quantizer.scale"],
+                state_dict["quantizer.zero_point_float"],
+                state_dict.get("quantizer.n_bits", n_bits),
+                state_dict.get("quantizer.group_size", group_size),
+            )
+            qlinear.quantizer.set_optim_enabled(True)
+            qlinear.quantizer_optim_enabled.fill_(True)
 
         qlinear.load_state_dict(state_dict)
         return qlinear

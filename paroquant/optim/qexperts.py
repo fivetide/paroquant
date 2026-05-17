@@ -7,25 +7,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from transformers.activations import ACT2FN
 from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeExperts
 
 from paroquant.kernels.cuda import scaled_pairwise_rotation
 
 from .quantizer import UniformAffineQuantizer
 
 
-def get_named_qwen3_5_moe_experts(module: nn.Module) -> dict[str, Qwen3_5MoeExperts]:
-    return {name: m for name, m in module.named_modules() if isinstance(m, Qwen3_5MoeExperts)}
-
-
-class PseudoQuantizedQwen3_5MoeExperts(nn.Module):
-    """Pseudo-quantized fused MoE experts for Qwen3.5-MoE."""
+class PseudoQuantizedMoEExperts(nn.Module):
+    """Pseudo-quantized fused GLU MoE experts."""
 
     def __init__(
         self,
-        experts: Qwen3_5MoeExperts,
+        experts: nn.Module,
         gate_up_rotation_pairs: Optional[list[torch.Tensor]],
         down_rotation_pairs: Optional[list[torch.Tensor]],
         gate_up_channel_scales: Optional[torch.Tensor],
@@ -41,10 +35,10 @@ class PseudoQuantizedQwen3_5MoeExperts(nn.Module):
         self.num_experts = experts.num_experts
         self.hidden_dim = experts.hidden_dim
         self.intermediate_dim = experts.intermediate_dim
-        self.act_fn = ACT2FN[self.config.hidden_act]
+        self.act_fn = experts.act_fn
 
         # Keep compatibility with current transformers grouped expert interfaces.
-        self.has_gate = getattr(experts, "has_gate", False)
+        self.has_gate = experts.has_gate
         self.has_bias = False
         self.is_transposed = False
 
@@ -351,9 +345,9 @@ class PseudoQuantizedQwen3_5MoeExperts(nn.Module):
     def from_state_dict(
         cls,
         state_dict: dict,
-        template: Qwen3_5MoeExperts,
+        template: nn.Module,
         device: torch.device | str,
-    ) -> "PseudoQuantizedQwen3_5MoeExperts":
+    ) -> "PseudoQuantizedMoEExperts":
         target_device = torch.device(device)
         target_dtype = template.gate_up_proj.dtype
 
@@ -410,14 +404,63 @@ class PseudoQuantizedQwen3_5MoeExperts(nn.Module):
             module.group_size = module.group_size.to(device=target_device)
             module.n_bits = module.n_bits.to(device=target_device)
             module.num_rotations = module.num_rotations.to(device=target_device)
-            module.set_optim_enabled(quantizer=True)
+
+            # Restore saved quantizers directly.  Calling
+            # set_optim_enabled(quantizer=True) would recompute quantizers from
+            # full rotated expert weights, creating multi-GB temporaries during
+            # resume and causing OOM on 35B MoE checkpoints.
+            if "gate_up_quantizer.scale" in state_dict:
+                module.gate_up_quantizer = UniformAffineQuantizer.from_state_tensors(
+                    state_dict["gate_up_quantizer.scale"].to(device=target_device, dtype=target_dtype),
+                    state_dict["gate_up_quantizer.zero_point_float"].to(device=target_device, dtype=target_dtype),
+                    state_dict.get("gate_up_quantizer.n_bits", n_bits),
+                    state_dict.get("gate_up_quantizer.group_size", group_size),
+                )
+                module.gate_up_quantizer.set_optim_enabled(True)
+                module.gate_up_quantizer_optim_enabled.fill_(True)
+            if "down_quantizer.scale" in state_dict:
+                module.down_quantizer = UniformAffineQuantizer.from_state_tensors(
+                    state_dict["down_quantizer.scale"].to(device=target_device, dtype=target_dtype),
+                    state_dict["down_quantizer.zero_point_float"].to(device=target_device, dtype=target_dtype),
+                    state_dict.get("down_quantizer.n_bits", n_bits),
+                    state_dict.get("down_quantizer.group_size", group_size),
+                )
+                module.down_quantizer.set_optim_enabled(True)
+                module.down_quantizer_optim_enabled.fill_(True)
 
         module.load_state_dict(state_dict)
         return module
 
 
+def is_fused_moe_experts(module: nn.Module) -> bool:
+    if isinstance(module, PseudoQuantizedMoEExperts):
+        return False
+
+    required_attrs = ("config", "num_experts", "hidden_dim", "intermediate_dim", "act_fn", "gate_up_proj", "down_proj")
+    if not all(hasattr(module, attr) for attr in required_attrs):
+        return False
+
+    gate_up_proj = module.gate_up_proj
+    down_proj = module.down_proj
+    if not isinstance(gate_up_proj, torch.Tensor) or not isinstance(down_proj, torch.Tensor):
+        return False
+    if gate_up_proj.ndim != 3 or down_proj.ndim != 3:
+        return False
+    if gate_up_proj.shape[0] != down_proj.shape[0]:
+        return False
+    if module.num_experts != gate_up_proj.shape[0]:
+        return False
+    if gate_up_proj.shape[-1] != down_proj.shape[-2]:
+        return False
+    return gate_up_proj.shape[-2] == 2 * down_proj.shape[-1]
+
+
+def get_named_moe_experts(module: nn.Module) -> dict[str, nn.Module]:
+    return {name: m for name, m in module.named_modules() if is_fused_moe_experts(m)}
+
+
 @torch.no_grad()
 def reset_moe_angles_by_mask(module: nn.Module) -> None:
     for submodule in module.modules():
-        if isinstance(submodule, PseudoQuantizedQwen3_5MoeExperts):
+        if isinstance(submodule, PseudoQuantizedMoEExperts):
             submodule.reset_angles_by_mask()

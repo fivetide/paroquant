@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors.torch import save_file as save_safetensors
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeExperts
 
-from paroquant.optim.qexperts import PseudoQuantizedQwen3_5MoeExperts, get_named_qwen3_5_moe_experts
+from paroquant.optim.qexperts import PseudoQuantizedMoEExperts, get_named_moe_experts, is_fused_moe_experts
 from paroquant.optim.util import get_named_linears, set_module_by_name
 
 
@@ -214,7 +214,7 @@ def _convert_pseudo(model: torch.nn.Module, result_dir: Path) -> int:
         layer = layer.cuda()
         modules: dict[str, torch.nn.Module] = {}
         modules.update(get_named_linears(layer))
-        modules.update(get_named_qwen3_5_moe_experts(layer))
+        modules.update(get_named_moe_experts(layer))
 
         for name, module in modules.items():
             pt_file = result_dir / f"{layer_idx}.{name}.pt"
@@ -226,8 +226,8 @@ def _convert_pseudo(model: torch.nn.Module, result_dir: Path) -> int:
                 module.weight.data.copy_(qlinear.pseudo_weight())
                 if module.bias is not None and qlinear.bias is not None:
                     module.bias.data.copy_(qlinear.bias.data)
-            elif isinstance(module, Qwen3_5MoeExperts):
-                qexperts = PseudoQuantizedQwen3_5MoeExperts.from_state_dict(sd, module, "cuda")
+            elif is_fused_moe_experts(module):
+                qexperts = PseudoQuantizedMoEExperts.from_state_dict(sd, module, "cuda")
                 module.gate_up_proj.data.copy_(qexperts.gate_up_proj.data)
                 module.down_proj.data.copy_(qexperts.down_proj.data)
             else:
@@ -418,6 +418,19 @@ def _convert_real(
     bits = group_size = krot = 0
     moe_entries: list[tuple[int, str, dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]] = []
 
+    # Snapshot original fp16 state_dict before any module replacement.
+    # We use this to (a) know the exact key names and (b) preserve standard
+    # fp16 .weight / .bias entries for every module — even the ones we
+    # quantize.  Qwen3_5MoeForConditionalGeneration (trust_remote_code)
+    # loads standard .weight keys; ParoQuant custom code loads qweight keys.
+    base_sd = model.state_dict()
+    original_weights: dict[str, torch.Tensor] = {
+        k: v.clone().cpu().to(torch.float16)  # type: ignore[code]
+        for k, v in base_sd.items()
+        if "weight" in k or "bias" in k
+    }
+    del base_sd  # free memory
+
     for layer_idx, layer in enumerate(tqdm(blocks, desc="Quantizing")):
         for name, module in get_named_linears(layer).items():
             pt_file = result_dir / f"{layer_idx}.{name}.pt"
@@ -439,7 +452,7 @@ def _convert_real(
             set_module_by_name(layer, name, rl)
             count += 1
 
-        for name, module in get_named_qwen3_5_moe_experts(layer).items():
+        for name, module in get_named_moe_experts(layer).items():
             pt_file = result_dir / f"{layer_idx}.{name}.pt"
             if not pt_file.exists():
                 continue
@@ -461,8 +474,14 @@ def _convert_real(
         "group_size": group_size,
         "krot": krot,
     }
-    state_dict = _inject_quantized_moe_state_dict(model.state_dict(), moe_entries)
-    return count, quant_config, state_dict
+    final_sd = _inject_quantized_moe_state_dict(model.state_dict(), moe_entries)
+    # Restore standard fp16 .weight / .bias entries alongside ParoQuant AWQ keys.
+    # This lets Qwen3_5MoeForConditionalGeneration load the model correctly
+    # (uses .weight for skip_modules; ParoQuant custom code uses qweight keys).
+    for k, v in original_weights.items():
+        if k not in final_sd:
+            final_sd[k] = v
+    return count, quant_config, final_sd
 
 
 @torch.no_grad()
@@ -499,7 +518,14 @@ def main() -> None:
     source_non_md = _copy_source_non_md_files(source_dir, output_path)
     _remove_safetensor_files(output_path)
 
-    model.save_pretrained(output_path, safe_serialization=True, state_dict=save_state_dict)
+    if args.mode == "real":
+        # Transformers 5 can prefix custom state_dict keys for wrapped models
+        # during save_pretrained(), which breaks PARO module-key matching on
+        # reload. Save the already-complete real state_dict directly instead.
+        assert save_state_dict is not None
+        save_safetensors(save_state_dict, output_path / "model.safetensors", metadata={"format": "pt"})
+    else:
+        model.save_pretrained(output_path, safe_serialization=True, state_dict=save_state_dict)
 
     # Restore original non-MD assets in case save_pretrained overwrote any.
     source_non_md = _copy_source_non_md_files(source_dir, output_path)

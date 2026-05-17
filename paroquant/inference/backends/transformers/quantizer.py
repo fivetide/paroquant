@@ -19,7 +19,12 @@ from transformers.utils.quantization_config import QuantizationConfigMixin
 
 import paroquant.kernels.cuda  # noqa: F401 — registers torch.ops.rotation.rotate
 
-from .modules import RotateQuantizedLinear
+from .modules import RotateQuantizedLinear, RotateQuantizedQwen35MoeExperts
+
+try:
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeExperts
+except Exception:  # pragma: no cover - depends on transformers version
+    Qwen3_5MoeExperts = None
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -92,7 +97,30 @@ class ParoQuantHfQuantizer(HfQuantizer):
             quantized_modules -= set(qcfg.modules_to_not_convert)
         logger.info("Found %d quantized modules in checkpoint.", len(quantized_modules))
 
-        for name, module in model.named_modules():
+        # Replace fused Qwen3.5 MoE expert containers before replacing dense
+        # linears. Real PARO checkpoints store expert tensors under keys such as
+        # ``...mlp.experts.0.gate_proj.qweight`` plus shared rotations under
+        # ``...mlp.experts.gate_up_weight_theta``.
+        if Qwen3_5MoeExperts is not None:
+            for name, module in list(model.named_modules()):
+                if not isinstance(module, Qwen3_5MoeExperts):
+                    continue
+                if f"{name}.0.gate_proj" not in quantized_modules:
+                    continue
+                parent_name, attr = name.rsplit(".", 1) if "." in name else ("", name)
+                parent = model.get_submodule(parent_name) if parent_name else model
+                setattr(
+                    parent,
+                    attr,
+                    RotateQuantizedQwen35MoeExperts(
+                        module,
+                        group_size=qcfg.group_size,
+                        bits=qcfg.bits,
+                        krot=qcfg.krot,
+                    ),
+                )
+
+        for name, module in list(model.named_modules()):
             if not isinstance(module, nn.Linear):
                 continue
             if name not in quantized_modules:
