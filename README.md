@@ -9,6 +9,38 @@
   <a href="https://pypi.org/project/paroquant/"><img src="https://img.shields.io/pypi/v/paroquant" alt="PyPI"></a>
 </p>
 
+## Shisa fork changes
+
+This branch is our working integration branch on top of upstream ParoQuant `v0.1.15`.  The fork-specific changes we intend to upstream/cherry-pick are:
+
+- **ROCm runtime support:** HIP-aware rotation extension loading plus ROCm fallbacks for ParoQuant/AWQ inference.
+- **ROCm AWQ kernels:** direct GEMV and dequantize+GEMM paths for W4A16 AWQ-style tensors, with small-batch GEMV defaults tuned for MoE expert inference.
+- **Qwen3.5/3.6 MoE real-export support:** real ParoQuant export preserves standard fp16 fallback weights when needed, saves exact PARO safetensors keys, and can load quantized Qwen MoE expert tensors in the Transformers backend.
+- **Packed/export workflow support:** packed checkpoints can remove duplicate fp16 fallback tensors while preserving the quantized PARO tensors used by packed-aware runtimes.
+- **Optimizer/checkpoint fixes:** saved quantizer tensors are restored directly during resume instead of recalibrating from full rotated weights, avoiding multi-GB temporary tensors on large MoE models.
+- **Calibration improvements:** JSONL calibration sources are supported, including text rows, chat/message rows, prompt/completion rows, and chosen/preference-style data.
+- **Build compatibility:** CUDA extension builds can select an older host compiler via `PAROQUANT_CUDAHOSTCXX`/`CUDAHOSTCXX` for CUDA 13.x toolchains on newer Linux distributions.
+
+### Qwen3.6-35B-A3B quality/size snapshot
+
+Canonical tx4/quality3 evaluation compares each candidate directly against the original BF16 HF model on the same scored token positions.
+
+| Model | Format | Size GiB ↓ | BPW ↓ | PPL ↓ | ΔNLL ↓ | KL nats ↓ | Top-1 % ↑ |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Original BF16 HF | HF safetensors | 66.966 | 16.435 | 6.5590 | +0.000000 | 0.000000 | 100.000 |
+| PARO full4096-e5 packed | packed safetensors | 19.068 | 4.680 | 6.6216 | +0.009506 | 0.034684 | 92.000 |
+| PARO full4096-e5 unpacked/original-format | legacy safetensors | 21.686 | 5.322 | 6.6216 | +0.009506 | 0.034684 | 92.000 |
+| GGUF UD-Q4_K_S | GGUF | 19.458 | 4.776 | 6.5783 | +0.003842 | 0.012800 | 94.999 |
+| GGUF UD-Q4_K_M | GGUF | 20.614 | 5.059 | 6.5643 | +0.001718 | 0.010849 | 95.354 |
+
+See [`docs/QUANTIZATION-QUALITY.md`](docs/QUANTIZATION-QUALITY.md) for metric definitions and the canonical evaluation protocol. Size GiB is active weight artifact bytes divided by `2^30`; BPW is active weight artifact bytes × 8 / `35,000,000,000`.
+
+Local runbooks and utilities for the Qwen3.6 PARO work are included under:
+
+- [`docs/PAROQUANT-COMPRESSION.md`](docs/PAROQUANT-COMPRESSION.md) — Qwen3.6 compression/optimization run notes.
+- [`docs/QUANTIZATION-QUALITY.md`](docs/QUANTIZATION-QUALITY.md) — canonical PPL/ΔNLL/KLD/top-1 evaluation protocol and interpretation notes.
+- [`scripts/`](scripts/) — calibration mix builders, quantization-quality eval scripts, safetensors patch/strip helpers, and comparison utilities used for the local Qwen3.6 experiments.
+
 State-of-the-art INT4 quantization for LLMs. ParoQuant uses learned pairwise rotations to suppress weight outliers, closing the accuracy gap with FP16 while running at near-AWQ speed. Supports NVIDIA GPUs (vLLM, Transformers) and Apple Silicon (MLX).
 
 ## Quick Start
