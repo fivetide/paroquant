@@ -25,7 +25,7 @@ class PseudoQuantizedLinear(nn.Module):
     ) -> None:
         super().__init__()
         self.enable_checkpoint = False
-        self.weight = nn.Parameter(linear.weight.clone())
+        self.weight = nn.Parameter(linear.weight.half().clone())
         self.in_feat = self.weight.shape[1]
         self.out_feat = self.weight.shape[0]
         num_groups = self.in_feat // group_size
