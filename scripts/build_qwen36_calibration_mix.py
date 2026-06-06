@@ -145,6 +145,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=20260510)
     p.add_argument("--chotto-sft", default=str(DEFAULT_CHOTTO_SFT))
     p.add_argument(
+        "--exclude-jsonl",
+        action="append",
+        default=None,
+        help="Existing JSONL file(s) whose rendered text hashes should be excluded from the generated split",
+    )
+    p.add_argument(
         "--cache-root",
         action="append",
         default=None,
@@ -405,6 +411,27 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def load_excluded_hashes(paths: list[str] | None, tokenizer: Any) -> set[str]:
+    hashes: set[str] = set()
+    for raw_path in paths or []:
+        path = Path(raw_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"--exclude-jsonl not found: {path}")
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                text = row_to_text(row, tokenizer).strip()
+                if text:
+                    hashes.add(stable_hash(text))
+    return hashes
+
+
 def main() -> int:
     args = parse_args()
     cache_roots = [Path(p) for p in args.cache_root] if args.cache_root else DEFAULT_TX4_CACHE_ROOTS
@@ -430,7 +457,9 @@ def main() -> int:
 
     train_tokens = args.train_samples * args.seq_len
     val_tokens = args.validation_samples * args.seq_len
-    used_hashes: set[str] = set()
+    used_hashes = load_excluded_hashes(args.exclude_jsonl, tokenizer)
+    if used_hashes:
+        print(f"Loaded {len(used_hashes)} excluded text hashes")
 
     train_rows, train_summary = collect_split(
         split_name="train",

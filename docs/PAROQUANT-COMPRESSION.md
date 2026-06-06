@@ -378,6 +378,21 @@ Build or rebuild the default final-calibration files with:
 mamba run -n llmcompressor python scripts/build_qwen36_calibration_mix.py
 ```
 
+To build a fresh no-overlap continuation/additional calibration split, exclude
+one or more existing JSONLs by rendered-text hash:
+
+```bash
+mamba run -n llmcompressor python scripts/build_qwen36_calibration_mix.py \
+  --train-samples 4096 \
+  --validation-samples 0 \
+  --exclude-jsonl /models/qwen36-calibration/qwen36-paro-tx4-codebreadth-chotto-4096-train-4096x2048-optfix.jsonl \
+  --output-prefix /models/qwen36-calibration/qwen36-paro-tx4-codebreadth-chotto-fresh4096-nooverlap
+```
+
+The `--exclude-jsonl` option may be repeated. It is useful for 50/50 old+fresh
+calibration runs where the new half should not repeat rendered rows from the
+old half.
+
 Current generated files:
 
 ```text
@@ -393,7 +408,13 @@ Recommended sample counts:
 | quick smoke | 1-8 | 1-2 | 128-512 | verify code path only |
 | PRO 6000 pilot | 128-256 | 16 | 2048 | validate all layers, runtime, and quality trend |
 | medium quality | 512-1024 | 32 | 2048 | useful if final recipe is too expensive |
-| final/default quality | 2048 | 64 | 2048 | matches upstream recipe shape |
+| first publishable quality | 4096 | 64 | 2048 | good quality/runtime tradeoff with runbook params |
+| larger calibration quality | 8192 | 64 | 2048 | modest extra quality; use activation spill |
+
+For 4096/8192 Qwen3.6 runs, keep sample counts divisible by `batch_size`.
+`get_mixed_calib_dataset` pads short mixed sources deterministically if a source
+retokenizes to one block fewer than requested, avoiding ragged batches and
+captured-kwarg shape mismatches in full-attention layers.
 
 ## Full low-calibration pilot
 
@@ -485,7 +506,11 @@ PYTHONPATH="$PARO_REPO" \
 
 ## Paper/default-style run
 
-Recommended final/default-quality run using the weighted local mix:
+Recommended final/default-quality run using the weighted local mix. The current
+best Qwen3.6 releases used the runbook parameters below, 5+5 epochs, batch size
+8, gradient accumulation 2, and 4096/8192 calibration samples. For 8192 samples,
+use `--activation-spill-dir` on fast local disk; without spill, activation
+streams can exceed system RAM.
 
 ```bash
 PARO_REPO=/home/lhl/paroquant/paroquant
@@ -504,11 +529,13 @@ PYTHONPATH="$PARO_REPO" \
   --skipped-modules "mlp.gate" "mlp.shared_expert_gate" "linear_attn.in_proj_a" "linear_attn.in_proj_b" \
   --datasets "$TRAIN_MIX" \
   --val-dataset "$VAL_MIX" \
-  --train-size 2048 \
+  --train-size 4096 \
   --validation-size 64 \
-  --batch-size 16 \
+  --batch-size 8 \
+  --gradient-accumulation-steps 2 \
   --seqlen 2048 \
-  --cache-shards 1 \
+  --cache-shards 8 \
+  --activation-spill-dir /models/qwen36-paroquant-spill/qwen36-final \
   --output-dir /models/qwen36-paroquant-work \
   --resume \
   --seed 0
@@ -519,10 +546,18 @@ On a 24GB 7900 XTX, expect to reduce `--batch-size` and compensate with
 --gradient-accumulation-steps 16`. This preserves effective batch size for
 optimizer stepping but increases wall time.
 
-On a 48-96GB PRO 6000 CUDA box, try the default `--batch-size 16` only after a
-1-layer `seqlen=2048` pilot. If it fits, that box is the preferred place to let
-the multi-day job run. If it OOMs, reduce to `--batch-size 8` or `4` and add
-matching `--gradient-accumulation-steps`.
+On a 48-96GB PRO 6000 CUDA box, use `--batch-size 8` with
+`--gradient-accumulation-steps 2` as the proven Qwen3.6 setting. `--cache-shards
+8` controls GPU activation-shard size; `--activation-spill-dir` controls host RAM
+by writing inter-layer activation streams to disk and loading them lazily. Prefer
+local NVMe (`/models/...`) over NAS/NFS for spill I/O. Add
+`--keep-activation-spill` only for debugging; by default spill files are removed
+as soon as their stream is no longer needed.
+
+For non-destructive continuation experiments, use `--init-from-dir OLD_RESULT`
+with a different `--output-dir NEW_RESULT`. This initializes layer states from an
+existing optimizer result directory while saving new states separately. Do not use
+the same directory for both flags.
 
 ## Export full PARO checkpoint
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,8 @@ from paroquant.optim.util import (
     empty_cache,
     logger,
     CachedTensorShards,
+    DiskTensorBatchStore,
+    LayerArgsBatches,
     RETAINED_KWARG_KEYS,
     to_device,
 )
@@ -81,8 +84,22 @@ class Config:
     # Increasing this reduces GPU memory usage but increases training time.
     cache_shards: int = 1
 
+    # Optional directory for disk-backed activation spill. When set, large
+    # inter-layer activation streams are written to this directory and loaded
+    # lazily by shard, reducing host RAM for large calibration sets such as 8192.
+    activation_spill_dir: str | None = None
+    # Keep spilled activation files after the run for debugging. By default the
+    # temporary per-stream spill directories are removed as soon as they are no
+    # longer needed.
+    keep_activation_spill: bool = False
+
     # Directory to save state dicts of optimized linear layers.
     output_dir: str
+
+    # Optional existing optimizer result directory to initialize from. This is
+    # for non-destructive continuation: load states from this directory, run
+    # more optimization, and save the new states into `output_dir`.
+    init_from_dir: str | None = None
 
     # Whether to resume from previously saved results in `output_dir`.
     resume: bool = False
@@ -120,8 +137,41 @@ def main():
     output_dir = output_dir / model_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    init_from_dir: Path | None = None
+    if args.init_from_dir is not None:
+        init_from_base = Path(args.init_from_dir)
+        init_from_model_dir = init_from_base / model_name
+        init_from_dir = init_from_model_dir if init_from_model_dir.exists() else init_from_base
+        if not init_from_dir.exists():
+            raise FileNotFoundError(f"--init-from-dir does not exist: {init_from_dir}")
+        if init_from_dir.resolve() == output_dir.resolve():
+            raise ValueError("--init-from-dir must be different from --output-dir for non-destructive continuation")
+        logger.info(f"Initializing optimization states from: {init_from_dir}")
+
     # Currently only support single GPU training.
     device = "cuda"
+
+    activation_spill_dir: Path | None = None
+    if args.activation_spill_dir is not None:
+        activation_spill_dir = Path(args.activation_spill_dir)
+        if activation_spill_dir.exists() and not args.keep_activation_spill:
+            shutil.rmtree(activation_spill_dir)
+        activation_spill_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Using disk-backed activation spill directory: %s", activation_spill_dir)
+
+    def make_activation_store(name: str):
+        if activation_spill_dir is None:
+            return []
+        return DiskTensorBatchStore(
+            activation_spill_dir / name,
+            overwrite=True,
+            delete_on_cleanup=not args.keep_activation_spill,
+        )
+
+    def cleanup_activation_batches(batches) -> None:
+        cleanup = getattr(batches, "cleanup", None)
+        if cleanup is not None:
+            cleanup()
 
     wandb_run = setup_wandb(args)
 
@@ -180,6 +230,7 @@ def main():
         blocks,
         samples,
         batch_size=args.batch_size,
+        first_layer_input_batches=make_activation_store("train/layer000-original-input"),
     )
 
     val_batch_size = args.val_batch_size or args.batch_size
@@ -193,25 +244,27 @@ def main():
         blocks,
         val_samples,
         batch_size=val_batch_size,
+        first_layer_input_batches=make_activation_store("val/layer000-original-input"),
     )
     new_retained_kwargs_batches = deepcopy(og_retained_kwargs_batches)
     new_val_retained_kwargs_batches = deepcopy(og_val_retained_kwargs_batches)
 
     model.cpu()
 
-    del samples
+    del samples, val_samples
     empty_cache()
 
     @torch.no_grad()
     def forward_layer_batch(
         layer: nn.Module,
-        args_batched: list[tuple[torch.Tensor, ...]],
+        args_batched,
         *,
         kwargs: dict,
         retained_kwargs_batches: list[dict],
         store_device: torch.device | str,
-    ) -> list[torch.Tensor]:
-        output_batched = []
+        store_name: str,
+    ):
+        output_batched = make_activation_store(store_name)
 
         layer.to(device)
         for batch_idx, args_batch in enumerate(args_batched):
@@ -222,9 +275,11 @@ def main():
             output = layer(*to_device(args_batch, device), **batch_kwargs)
             if isinstance(output, tuple):
                 output = output[0]
+            output = output.detach()
             if output.device != store_device:
                 output = output.to(store_device)
             output_batched.append(output)
+            del output
             for key in RETAINED_KWARG_KEYS:
                 if key in batch_kwargs:
                     retained_kwargs_batches[batch_idx][key] = to_device(batch_kwargs[key], "cpu")
@@ -234,12 +289,10 @@ def main():
         return output_batched
 
     def make_layer_args_batches(
-        input_batches: list[torch.Tensor],
+        input_batches,
         other_args_batches: list[tuple[torch.Tensor, ...]],
-    ) -> list[tuple[torch.Tensor, ...]]:
-        return [
-            (input_batch, *other_args_batch) for input_batch, other_args_batch in zip(input_batches, other_args_batches)
-        ]
+    ) -> LayerArgsBatches:
+        return LayerArgsBatches(input_batches, other_args_batches)
 
     def init_rotation_data(
         weight: torch.Tensor,
@@ -297,6 +350,7 @@ def main():
             kwargs=kwargs_list[layer_idx],
             retained_kwargs_batches=og_retained_kwargs_batches,
             store_device="cpu",
+            store_name=f"train/layer{layer_idx:03d}-original-output",
         )
         og_layer_val_output_batches = forward_layer_batch(
             layer,
@@ -304,7 +358,20 @@ def main():
             kwargs=val_kwargs_list[layer_idx],
             retained_kwargs_batches=og_val_retained_kwargs_batches,
             store_device="cpu",
+            store_name=f"val/layer{layer_idx:03d}-original-output",
         )
+
+        # The original input stream for this layer is no longer needed once
+        # original outputs have been captured. For layer 0 it is also the
+        # quantized-path input, so defer that cleanup until after new output
+        # capture below.
+        if layer_idx > 0:
+            cleanup_activation_batches(og_layer_input_batches)
+            cleanup_activation_batches(og_layer_val_input_batches)
+            del og_layer_args_batches, og_layer_val_args_batches
+            og_layer_input_batches = None
+            og_layer_val_input_batches = None
+            empty_cache()
 
         if layer_idx > 0:
             layer_args_batches = make_layer_args_batches(
@@ -378,6 +445,22 @@ def main():
                     raise NotImplementedError(f"Unsupported module type: {type(old_module)}")
                 named_pseudo_modules[name] = new_module
                 continue
+
+            if init_from_dir is not None:
+                init_result_file = init_from_dir / f"{layer_idx}.{name}.pt"
+                if init_result_file.exists():
+                    sd = torch.load(init_result_file, map_location=device)
+                    if isinstance(old_module, nn.Linear):
+                        new_module = PseudoQuantizedLinear.from_state_dict(sd)
+                        set_module_by_name(layer, name, new_module)
+                    elif is_fused_moe_experts(old_module):
+                        new_module = PseudoQuantizedMoEExperts.from_state_dict(sd, old_module, device)
+                        set_module_by_name(layer, name, new_module)
+                    else:
+                        raise NotImplementedError(f"Unsupported module type: {type(old_module)}")
+                    named_pseudo_modules[name] = new_module
+                    logger.info(f"Initialized {layer_idx}.{name} from {init_result_file}")
+                    continue
 
             old_module.to(device)
             if isinstance(old_module, nn.Linear):
@@ -523,6 +606,22 @@ def main():
 
             set_checkpointing_enabled(named_pseudo_modules, False)
 
+            train_args_batches.clear_cache()
+            train_output_batches.clear_cache()
+            del (
+                train_args_batches,
+                train_output_batches,
+                val_args_batches,
+                val_output_batches,
+                train_kwargs_batches,
+                val_kwargs_batches,
+            )
+            empty_cache()
+
+        else:
+            logger.info(f"Skipping optimization for layer {layer_idx}: already been optimized.")
+            train_args_batches.clear_cache()
+            train_output_batches.clear_cache()
             del (
                 train_args_batches,
                 train_output_batches,
@@ -531,27 +630,38 @@ def main():
             )
             empty_cache()
 
-        else:
-            logger.info(f"Skipping optimization for layer {layer_idx}: already been optimized.")
-
         layer.to(device=device, dtype=layer_eval_dtype)
 
         logger.info("Capturing new layer output...")
-        new_layer_output_batches = forward_layer_batch(
+        next_new_layer_output_batches = forward_layer_batch(
             layer,
             layer_args_batches,
             kwargs=kwargs_list[layer_idx],
             retained_kwargs_batches=new_retained_kwargs_batches,
             store_device="cpu",
+            store_name=f"train/layer{layer_idx:03d}-quant-output",
         )
-        new_layer_val_output_batches = forward_layer_batch(
+        next_new_layer_val_output_batches = forward_layer_batch(
             layer,
             layer_val_args_batches,
             kwargs=val_kwargs_list[layer_idx],
             retained_kwargs_batches=new_val_retained_kwargs_batches,
             store_device="cpu",
+            store_name=f"val/layer{layer_idx:03d}-quant-output",
         )
 
+        if layer_idx > 0:
+            cleanup_activation_batches(new_layer_output_batches)
+            cleanup_activation_batches(new_layer_val_output_batches)
+        else:
+            cleanup_activation_batches(og_layer_input_batches)
+            cleanup_activation_batches(og_layer_val_input_batches)
+        del layer_args_batches, layer_val_args_batches
+        if layer_idx == 0:
+            del og_layer_args_batches, og_layer_val_args_batches
+
+        new_layer_output_batches = next_new_layer_output_batches
+        new_layer_val_output_batches = next_new_layer_val_output_batches
         og_layer_input_batches = og_layer_output_batches
         og_layer_val_input_batches = og_layer_val_output_batches
 
@@ -568,6 +678,13 @@ def main():
             )
 
         layer.cpu()
+
+    cleanup_activation_batches(og_layer_input_batches)
+    cleanup_activation_batches(og_layer_val_input_batches)
+    if "new_layer_output_batches" in locals():
+        cleanup_activation_batches(new_layer_output_batches)
+    if "new_layer_val_output_batches" in locals():
+        cleanup_activation_batches(new_layer_val_output_batches)
 
     if wandb_run is not None:
         wandb_run.finish()

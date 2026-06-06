@@ -6,7 +6,9 @@ import json
 import logging
 import math
 import random
+import shutil
 import warnings
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Iterable, TypeVar
 
@@ -278,7 +280,19 @@ def get_mixed_calib_dataset(
                 split=split,
             )
         )
-    assert len(results) == n_samples, f"Expected {n_samples} samples, got {len(results)}"
+    if len(results) < n_samples:
+        if len(results) == 0:
+            raise ValueError(f"Mixed calibration produced no samples, requested {n_samples}")
+        missing = n_samples - len(results)
+        logger.warning(
+            "Mixed calibration produced %d samples, requested %d (%.1f%% coverage). "
+            "Padding with %d deterministic duplicate sample(s) to preserve fixed batch shapes.",
+            len(results), n_samples, 100 * len(results) / n_samples, missing,
+        )
+        for i in range(missing):
+            sample = results[i % len(results)]
+            results.append(sample.clone() if isinstance(sample, torch.Tensor) else sample)
+    results = results[:n_samples]
 
     rand = random.Random(seed)
     rand.shuffle(results)
@@ -374,10 +388,13 @@ def capture_layer_inputs_and_args(
     layers: nn.ModuleList,
     samples: torch.Tensor,
     batch_size: int | None,
-) -> tuple[list[torch.Tensor], list[dict], list[list[tuple[torch.Tensor, ...]]], list[dict]]:
+    *,
+    first_layer_input_batches=None,
+) -> tuple[Any, list[dict], list[list[tuple[torch.Tensor, ...]]], list[dict]]:
     device = samples.device
     kwargs_list: list[dict] = [{} for _ in range(len(layers))]
-    first_layer_input_batches: list[torch.Tensor] = []
+    if first_layer_input_batches is None:
+        first_layer_input_batches = []
     other_args_batches_list: list[list[tuple[torch.Tensor, ...]]] = [[] for _ in range(len(layers))]
     retained_kwargs_batches: list[dict] = []
 
@@ -417,9 +434,12 @@ def capture_layer_inputs_and_args(
         layers[layer_idx] = Catcher(layer, layer_idx)
 
     batch_size = samples.shape[0] if batch_size is None or batch_size <= 0 else batch_size
-    num_batches = samples.shape[0] // batch_size
-    samples_batch = samples.chunk(num_batches)
-    for samples in samples_batch:
+    if samples.shape[0] % batch_size != 0:
+        raise ValueError(
+            f"Number of calibration samples ({samples.shape[0]}) must be divisible by batch_size ({batch_size}). "
+            "Ragged batches cannot safely reuse captured layer kwargs."
+        )
+    for samples in samples.split(batch_size):
         model(samples)
 
     for layer_idx, layer in enumerate(layers):
@@ -443,6 +463,105 @@ def _tensor_batch_device(batch) -> torch.device:
     return batch.device
 
 
+class DiskTensorBatchStore:
+    """Disk-backed sequence for activation batches.
+
+    Batches are saved one file at a time and loaded lazily by __getitem__.
+    This keeps inter-layer activation streams out of host RAM while preserving
+    the list-like API used by the layerwise optimizer.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        batches=None,
+        *,
+        overwrite: bool = False,
+        delete_on_cleanup: bool = True,
+    ):
+        self.path = Path(path)
+        if overwrite and self.path.exists():
+            shutil.rmtree(self.path)
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.delete_on_cleanup = delete_on_cleanup
+        self._len = 0
+        self._closed = False
+
+        if batches is not None:
+            self.extend(batches)
+
+    def _batch_path(self, index: int) -> Path:
+        return self.path / f"{index:06d}.pt"
+
+    def append(self, batch) -> None:
+        if self._closed:
+            raise RuntimeError(f"Cannot append to closed activation store: {self.path}")
+        torch.save(to_device(batch, "cpu"), self._batch_path(self._len))
+        self._len += 1
+
+    def extend(self, batches) -> None:
+        for batch in batches:
+            self.append(batch)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self._len)
+            return [self[i] for i in range(start, stop, step)]
+        if index < 0:
+            index += self._len
+        if index < 0 or index >= self._len:
+            raise IndexError(index)
+        return torch.load(self._batch_path(index), map_location="cpu")
+
+    def __iter__(self):
+        for index in range(self._len):
+            yield self[index]
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.delete_on_cleanup and self.path.exists():
+            shutil.rmtree(self.path, ignore_errors=True)
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+
+class LayerArgsBatches:
+    """Lazy tuple(input_batch, *other_args) view over layer activation batches."""
+
+    def __init__(self, input_batches, other_args_batches: list[tuple[torch.Tensor, ...]]):
+        if len(input_batches) != len(other_args_batches):
+            raise ValueError(
+                f"Mismatched layer args: {len(input_batches)} input batches vs "
+                f"{len(other_args_batches)} other-args batches"
+            )
+        self.input_batches = input_batches
+        self.other_args_batches = other_args_batches
+
+    def __len__(self) -> int:
+        return len(self.input_batches)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        input_batch = self.input_batches[index]
+        other_args_batch = self.other_args_batches[index]
+        return (input_batch, *other_args_batch)
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+
 class CachedTensorShards:
 
     def __init__(
@@ -453,7 +572,8 @@ class CachedTensorShards:
         target_device: torch.device | str,
         offload_device: torch.device | str = torch.device("cpu"),
     ):
-        assert len(batches) % num_shards == 0
+        if num_shards > len(batches):
+            num_shards = max(1, len(batches))
         if _tensor_batch_device(batches[0]) != offload_device:
             self.batches = [_move_tensor_batch(b, offload_device) for b in batches]
         else:
@@ -466,10 +586,15 @@ class CachedTensorShards:
     def _switch_shard(self, shard_index: int) -> None:
         if self.current_shard == shard_index:
             return
+        self.clear_cache()
         self.current_shard = shard_index
         start, end = self._get_shard_range(shard_index)
         self.cached_shard = self.batches[start:end]
         self.cached_shard = [_move_tensor_batch(b, self.target_device) for b in self.cached_shard]
+
+    def clear_cache(self) -> None:
+        self.cached_shard = None
+        self.current_shard = None
 
     def _get_shard_range(self, index: int) -> tuple[int, int]:
         if self.num_shards == 1:
@@ -484,11 +609,11 @@ class CachedTensorShards:
 
     def __getitem__(self, index: int) -> torch.Tensor | tuple[torch.Tensor, ...]:
         shard_len = len(self.batches) // self.num_shards
-        shard_index = index // shard_len
+        shard_index = min(index // shard_len, self.num_shards - 1)
         if self.current_shard != shard_index:
             self._switch_shard(shard_index)
-        offset = index % shard_len
-        return self.cached_shard[offset]
+        shard_start, _ = self._get_shard_range(shard_index)
+        return self.cached_shard[index - shard_start]
 
     def __iter__(self) -> "Iterator":
         return self.Iterator(self)

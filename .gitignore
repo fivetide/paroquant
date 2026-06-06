@@ -17,5 +17,6 @@ dist/
 
 output/
 models/
+.pi/
 
 .DS_Store
